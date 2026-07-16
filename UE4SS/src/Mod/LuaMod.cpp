@@ -1805,6 +1805,19 @@ Overloads:
                             }
                         }
                     }
+                    if (auto data_ptr = LuaMod::find_function_hook_data(LuaMod::m_script_hook_pre_callbacks, unreal_function); data_ptr)
+                    {
+                        Output::send<LogLevel::Verbose>(STR("Unregistering script hook with id: {}, FunctionName: {}\n"), pre_id, function_name_no_prefix);
+                        auto& registry_indexes = data_ptr->callback_data.registry_indexes;
+                        for (auto& registry_index : registry_indexes)
+                        {
+                            if (pre_id == registry_index.second.identifier)
+                            {
+                                registry_index.second.lua_index = -1;
+                                break;
+                            }
+                        }
+                    }
                 }
                 else
                 {
@@ -4162,10 +4175,20 @@ Overloads:
                     function_data = &m_script_hook_callbacks.emplace_back(get_object_names(unreal_function), LuaCallbackData{hook_lua, nullptr, {}});
                 }
                 auto& callback_data = function_data->callback_data;
-                // Note that non-native hooks don't have a different id for the post-callback.
-                pre_id = Unreal::UnrealScriptFunctionData::MakeNewId();
-                post_id = pre_id;
-                callback_data.registry_indexes.emplace_back(hook_lua, LuaCallbackData::RegistryIndex{lua_callback_registry_index, pre_id});
+                post_id = Unreal::UnrealScriptFunctionData::MakeNewId();
+                pre_id = post_id;
+                callback_data.registry_indexes.emplace_back(hook_lua, LuaCallbackData::RegistryIndex{lua_callback_registry_index, post_id});
+                if (has_post_callback)
+                {
+                    auto function_pre_data = find_function_hook_data(m_script_hook_pre_callbacks, unreal_function);
+                    if (!function_pre_data)
+                    {
+                        function_pre_data = &m_script_hook_pre_callbacks.emplace_back(get_object_names(unreal_function), LuaCallbackData{hook_lua, nullptr, {}});
+                    }
+                    auto& callback_pre_data = function_pre_data->callback_data;
+                    pre_id = Unreal::UnrealScriptFunctionData::MakeNewId();
+                    callback_pre_data.registry_indexes.emplace_back(hook_lua, LuaCallbackData::RegistryIndex{lua_post_callback_registry_index, pre_id});
+                }
                 Output::send<LogLevel::Verbose>(STR("[RegisterHook] Registered script hook ({}, {}) for {}\n"),
                                                 pre_id,
                                                 post_id,
@@ -6003,6 +6026,7 @@ Overloads:
         erase_from_container(this, m_local_player_exec_pre_callbacks);
         erase_from_container(this, m_local_player_exec_post_callbacks);
         erase_from_container(this, m_script_hook_callbacks);
+        erase_from_container(this, m_script_hook_pre_callbacks);
 
         UE4SSProgram::get_program().get_all_input_events([&](auto& key_set) {
             std::erase_if(key_set.key_data,
@@ -6293,6 +6317,139 @@ Overloads:
         TRY([&] {
             execute_hook(LuaMod::m_custom_event_callbacks, false);
             execute_hook(LuaMod::m_script_hook_callbacks, true);
+        });
+    }
+
+    static auto script_pre_hook([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData, [[maybe_unused]] Unreal::UObject* Context, Unreal::FFrame& Stack, [[maybe_unused]] void* RESULT_DECL) -> void
+    {
+        std::lock_guard<std::recursive_mutex> guard{LuaMod::m_thread_actions_mutex};
+
+        auto execute_hook = [&](std::vector<LuaMod::FunctionHookData>& callback_container, bool precise_name_match) {
+            if (callback_container.empty())
+            {
+                return;
+            }
+            auto data = precise_name_match ? LuaMod::find_function_hook_data(callback_container, Stack.Node())
+                                           : LuaMod::find_function_hook_data(callback_container, Stack.Node()->GetNamePrivate());
+            if (data)
+            {
+                const auto& callback_data = data->callback_data;
+                for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
+                {
+                    const auto& lua = *lua_ptr;
+
+                    // -1 is a special value that signifies that the hook has been unregistered.
+                    if (registry_index.lua_index == -1)
+                    {
+                        continue;
+                    }
+
+                    lua.registry().get_function_ref(registry_index.lua_index);
+
+                    static auto s_object_property_name = Unreal::FName(STR("ObjectProperty"), Unreal::FNAME_Find);
+                    LuaType::RemoteUnrealParam::construct(lua, &Context, s_object_property_name);
+
+                    auto node = Stack.Node();
+                    auto return_value_offset = node->GetReturnValueOffset();
+                    auto has_return_value = return_value_offset != 0xFFFF;
+                    auto num_unreal_params = node->GetNumParms();
+                    if (has_return_value && num_unreal_params > 0)
+                    {
+                        --num_unreal_params;
+                    }
+
+                    if (has_return_value || num_unreal_params > 0)
+                    {
+                        for (Unreal::FProperty* param : Unreal::TFieldRange<Unreal::FProperty>(node, Unreal::EFieldIterationFlags::IncludeDeprecated))
+                        {
+                            if (!param->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_Parm))
+                            {
+                                continue;
+                            }
+                            if (has_return_value && param->GetOffset_Internal() == return_value_offset)
+                            {
+                                continue;
+                            }
+
+                            auto param_type = param->GetClass().GetFName();
+                            auto param_type_comparison_index = param_type.GetComparisonIndex();
+                            if (auto it = LuaType::StaticState::m_property_value_pushers.find(param_type_comparison_index);
+                                it != LuaType::StaticState::m_property_value_pushers.end())
+                            {
+                                void* data{};
+                                if (param->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_OutParm))
+                                {
+                                    data = Unreal::FindOutParamValueAddress(Stack, param);
+                                }
+                                else
+                                {
+                                    data = param->ContainerPtrToValuePtr<void>(Stack.Locals());
+                                }
+                                const LuaType::PusherParams pusher_param{
+                                        .operation = LuaType::Operation::GetParam,
+                                        .lua = lua,
+                                        .base = nullptr,
+                                        .data = data,
+                                        .property = param,
+                                };
+                                auto& type_handler = it->second;
+                                type_handler(pusher_param);
+                            }
+                            else
+                            {
+                                lua.throw_error(fmt::format(
+                                        "[script_hook] Tried accessing unreal property without a registered handler. Property type '{}' not supported.",
+                                        to_string(param_type.ToString())));
+                            }
+                        };
+                    }
+
+                    lua.call_function(num_unreal_params + 1, 1);
+
+                    bool return_value_handled{};
+                    if (has_return_value && RESULT_DECL && lua.get_stack_size() > 0 && !lua.is_nil())
+                    {
+                        auto return_property = node->GetReturnProperty();
+                        if (return_property)
+                        {
+                            auto return_property_type = return_property->GetClass().GetFName();
+                            auto return_property_type_comparison_index = return_property_type.GetComparisonIndex();
+
+                            if (auto it = LuaType::StaticState::m_property_value_pushers.find(return_property_type_comparison_index);
+                                it != LuaType::StaticState::m_property_value_pushers.end())
+                            {
+                                const LuaType::PusherParams pusher_params{.operation = LuaType::Operation::Set,
+                                                                          .lua = lua,
+                                                                          .base = static_cast<Unreal::UObject*>(RESULT_DECL),
+                                                                          .data = RESULT_DECL,
+                                                                          .property = return_property};
+                                auto& type_handler = it->second;
+                                type_handler(pusher_params);
+                                return_value_handled = true;
+                            }
+                            else
+                            {
+                                auto return_property_type_name = return_property_type.ToString();
+                                auto return_property_name = return_property->GetName();
+
+                                Output::send(STR("Tried altering return value of a custom BP function without a registered handler for return type Return "
+                                                 "property '{}' of type '{}' not supported."),
+                                             return_property_name,
+                                             return_property_type_name);
+                            }
+                        }
+                    }
+
+                    if (!return_value_handled)
+                    {
+                        lua.discard_value();
+                    }
+                }
+            }
+        };
+
+        TRY([&] {
+            execute_hook(LuaMod::m_script_hook_pre_callbacks, true);
         });
     }
 
@@ -7072,11 +7229,13 @@ Overloads:
         if (Unreal::UObject::ProcessLocalScriptFunctionInternal.is_ready() && Unreal::Version::IsAtLeast(4, 22))
         {
             Output::send(STR("Enabling custom events\n"));
+            Unreal::Hook::RegisterProcessLocalScriptFunctionPreCallback(script_pre_hook, {false, false, STR("UE4SS"), STR("LuaModImplScriptHook")});
             Unreal::Hook::RegisterProcessLocalScriptFunctionPostCallback(script_hook, {false, false, STR("UE4SS"), STR("LuaModImplScriptHook")});
         }
         else if (Unreal::UObject::ProcessInternalInternal.is_ready() && Unreal::Version::IsBelow(4, 22))
         {
             Output::send(STR("Enabling custom events\n"));
+            Unreal::Hook::RegisterProcessInternalPreCallback(script_pre_hook, {false, false, STR("UE4SS"), STR("LuaModImplScriptHook")});
             Unreal::Hook::RegisterProcessInternalPostCallback(script_hook, {false, false, STR("UE4SS"), STR("LuaModImplScriptHook")});
         }
     }
